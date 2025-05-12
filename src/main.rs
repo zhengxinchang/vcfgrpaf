@@ -1,48 +1,42 @@
 // src/main.rs
 use anyhow::{Context, Result};
-use clap::{ArgAction, Parser};
+use clap::Parser;
 use csv::ReaderBuilder;
-use log::{debug, info};
-use rust_htslib::bcf::{self, header::HeaderRecord, Header, Read, Record, Writer};
-use rust_htslib::bcf::record::GenotypeAllele;
-use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{self, Read as _};
+use rust_htslib::{
+    bam::header,
+    bcf::{self, Header, HeaderRecord, Read, Reader as BcfReader, Writer},
+};
 
-/// Command‑line options ------------------------------------------------------
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+};
+
 #[derive(Parser, Debug)]
-#[command(author, version, about)]
+#[command(
+    author,
+    version,
+    about = "This program is the rust re-implimentation of grpaf.py from truvari"
+)]
 struct Opts {
-    /// VCF input (default: stdin)
-    #[arg(value_name = "VCF", default_value = "-")]
+    /// VCF input
+    #[arg(value_name = "VCF")]
     input: String,
 
-    /// Output VCF (default: stdout)
-    #[arg(short, long, default_value = "-")]
+    /// Output VCF
+    #[arg(short, long)]
     output: String,
 
     /// Tab‑delimited 2‑col file: <sample> <group>
     #[arg(short, long)]
     labels: String,
-
-    /// Comma‑sep tags to add, or ‘all’
-    #[arg(short, long, default_value = "all")]
-    tags: String,
-
-    /// Abort if labels contain samples absent from VCF
-    #[arg(long, action = ArgAction::SetTrue)]
-    strict: bool,
-
-    /// Verbose logging
-    #[arg(long, action = ArgAction::SetTrue)]
-    debug: bool,
 }
 
 /// Per‑variant statistics ----------------------------------------------------
 #[derive(Default, Debug, Clone)]
 struct AfStats {
-    ac: [u32; 2],     // allele counts (REF, ALT)
-    an: u32,          // allele number
+    ac: [u32; 2], // allele counts (REF, ALT)
+    an: u32,      // allele number
     n_hemi: u32,
     n_homref: u32,
     n_het: u32,
@@ -51,27 +45,6 @@ struct AfStats {
     af: f64,
     maf: f64,
     mac: u32,
-    exc_het: f64,
-    hwe: f64,
-}
-
-/// Hardy‑Weinberg exact test + excess‑het flag (简化版，与 truvari 近似)
-fn calc_hwe(ac0: u32, ac1: u32, n_het: u32) -> (f64, f64) {
-    // 参考 Wigginton et al. 2005 (PMID:15789306)  
-    // 这里给出一个数值稳定的近似实现
-    let n_homref = (ac0 - n_het) / 2;
-    let n_homalt = (ac1 - n_het) / 2;
-    let n = n_homref + n_het + n_homalt;
-
-    if n == 0 {
-        return (0.0, 0.0);
-    }
-
-    let exp_het = (2.0 * (ac0 as f64) * (ac1 as f64)) / ((2 * n) as f64);
-    let chi_sq = ((n_het as f64 - exp_het).powi(2)) / exp_het.max(1.0);
-    let p = (-0.5 * chi_sq).exp();      // 近似 p‑value
-    let exc_het = if p < 1e-6 { 0.0 } else { 1.0 }; // 1=good, 0=bad
-    (exc_het, p)
 }
 
 /// 计算所有统计量（单群体，等价于 Python 的 calc_af）
@@ -118,25 +91,14 @@ fn calc_af(genotypes: &[Option<[Option<u8>; 2]>]) -> AfStats {
         st.af = st.ac[1] as f64 / st.an as f64;
         st.mac = st.ac[0].min(st.ac[1]);
         st.maf = st.mac as f64 / st.an as f64;
-        let (exc_het, hwe) = calc_hwe(st.ac[0], st.ac[1], st.n_het);
-        st.exc_het = exc_het;
-        st.hwe = hwe;
     }
     st
 }
 
-/// ------------- 主程序 ------------------------------------------------------
 fn main() -> Result<()> {
     let opts = Opts::parse();
 
-    // logging
-    if opts.debug {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
-    } else {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    }
-
-    // ------------------- 读取 label 文件 ------------------------------------
+    // read labels
     #[derive(serde::Deserialize)]
     struct Rec {
         sample: String,
@@ -153,27 +115,20 @@ fn main() -> Result<()> {
         group_map.entry(rec.group).or_default().push(rec.sample);
     }
     let groups: Vec<String> = group_map.keys().cloned().collect();
-    info!("Loaded {} groups from {}", groups.len(), opts.labels);
+    println!("Loaded {} groups from {}", groups.len(), opts.labels);
 
-    // ------------------- 打开 VCF -------------------------------------------
-    let mut reader: Box<dyn Read> = if opts.input == "-" {
-        Box::new(io::stdin())
-    } else {
-        Box::new(File::open(&opts.input).with_context(|| "opening VCF")?)
-    };
-    let mut bcf = bcf::Reader::from_stream(&mut reader).with_context(|| "reading VCF")?;
-    let samples: Vec<String> = bcf.header().samples().iter().map(|s| String::from_utf8_lossy(s).into()).collect();
+    // open input VCF
 
-    // sanity check
-    if opts.strict {
-        for (s, _) in group_map.values().flat_map(|v| v.iter()) {
-            if !samples.contains(s) {
-                anyhow::bail!("Sample `{s}` in --labels but not in VCF header (strict mode)");
-            }
-        }
-    }
+    let mut bcf: BcfReader = BcfReader::from_path(&opts.input).expect("Error opening file.");
+    let mut headerview: bcf::header::HeaderView = bcf.header().clone();
 
-    // -------------- 构建每组 sample mask ------------------------------------
+    let samples: Vec<String> = headerview
+        .samples()
+        .iter()
+        .map(|s| String::from_utf8_lossy(s).into())
+        .collect();
+
+    // make masks for each group
     let mut masks: HashMap<String, Vec<bool>> = HashMap::new();
     for (grp, list) in &group_map {
         let set: HashSet<&String> = list.iter().collect();
@@ -183,21 +138,15 @@ fn main() -> Result<()> {
         );
     }
 
-    // ----------------- 克隆并扩充 header ------------------------------------
+    // inject new header lines
     let mut out_hdr = Header::from_template(bcf.header());
-    let all_tags = [
-        "AF", "MAF", "ExcHet", "HWE", "MAC", "AC", "AN", "N_HEMI", "N_MISS",
-        "N_HOMREF", "N_HET", "N_HOMALT",
+    let want_tags = [
+        "AF", "MAF", "MAC", "AC", "AN", "N_HEMI", "N_MISS", "N_HOMREF", "N_HET", "N_HOMALT",
     ];
-    let want_tags: Vec<&str> = if opts.tags == "all" {
-        all_tags.to_vec()
-    } else {
-        opts.tags.split(',').collect()
-    };
 
     let mut add_info_line = |id: &str, num: &str, typ: &str, desc: &str| {
         let line = format!("##INFO=<ID={id},Number={num},Type={typ},Description=\"{desc}\">");
-        out_hdr.push_record(HeaderRecord::from_str(&line));
+        out_hdr.push_record(line.as_bytes());
     };
 
     for grp in &groups {
@@ -207,13 +156,17 @@ fn main() -> Result<()> {
                 "AC" | "MAC" => add_info_line(
                     &format!("{t}_{grp}"),
                     "A",
-                    if *t == "AC" || *t == "MAC" { "Integer" } else { "Float" },
+                    if *t == "AC" || *t == "MAC" {
+                        "Integer"
+                    } else {
+                        "Float"
+                    },
                     &format!("{t} on {count} {grp} samples"),
                 ),
                 _ => add_info_line(
                     &format!("{t}_{grp}"),
                     "1",
-                    if ["AF", "MAF", "ExcHet", "HWE"].contains(t) {
+                    if ["AF", "MAF"].contains(t) {
                         "Float"
                     } else {
                         "Integer"
@@ -224,58 +177,123 @@ fn main() -> Result<()> {
         }
     }
 
-    // ----------------- 打开输出 ---------------------------------------------
+    let all_tags = [
+        "ExcHet_",
+        "HWE_",
+        "AF_",
+        "MAF_",
+        "MAC_",
+        "AC_",
+        "AN_",
+        "N_HEMI_",
+        "N_MISS_",
+        "N_HOMREF_",
+        "N_HET_",
+        "N_HOMALT_",
+    ];
+
+    // generates all tags that start with all_tags in to a vec
+    let mut all_tags_combination: Vec<String> = Vec::new();
+    for (tag, values) in headerview
+        .header_records()
+        .iter()
+        .filter_map(|record| match record {
+            HeaderRecord::Info { key, values } => Some((key, values)),
+            _ => None,
+        })
+    {
+        let empty = String::from("NOT_FOUND");
+        let id = values.get("ID").unwrap_or(&empty);
+        if all_tags.iter().any(|x| {
+            if id == "ANNOVAR_DATE" {
+                dbg!(x, id);
+            }
+            id.starts_with(x)
+        }) {
+            all_tags_combination.push(id.to_string());
+        }
+    }
+
+    eprintln!("Found {:?} tags in input VCF", all_tags_combination);
+
+    // open output file
     let mut writer = if opts.output == "-" {
-        Writer::from_stdout(&out_hdr, true, bcf::Format::VCF)?
+        Writer::from_stdout(&out_hdr, true, bcf::Format::Vcf)?
     } else {
-        Writer::from_path(&opts.output, &out_hdr, true, bcf::Format::VCF)?
+        Writer::from_path(&opts.output, &out_hdr, true, bcf::Format::Vcf)?
     };
 
-    // ----------------- 逐 variant 处理 --------------------------------------
+    // process each record
+    let mut processed = 0;
     for rec_result in bcf.records() {
+        processed += 1;
+        if processed % 10000 == 0 {
+            println!("Processed {processed} variants");
+        }
         let mut rec = rec_result?;
-        let gts = rec.genotypes()?;
 
-        // 为每个 group 收集其 sample genotype
-        for grp in &groups {
-            let mask = &masks[grp];
-            let mut gt_vec: Vec<Option<[Option<u8>; 2]>> = Vec::new();
-            for (samp_idx, alleles) in gts.iter().enumerate() {
-                if !mask[samp_idx] {
-                    continue;
+        // remove all_tags if present
+
+        let gt_vec_map: HashMap<String, Vec<Option<[Option<u8>; 2]>>> = {
+            let gts = rec.genotypes()?;
+            let mut map = HashMap::new();
+            for grp in &groups {
+                let mask = &masks[grp];
+                let mut gt_vec: Vec<Option<[Option<u8>; 2]>> = Vec::new();
+                for samp_idx in 0..headerview.samples().len() {
+                    let alleles = gts.get(samp_idx);
+                    if !mask[samp_idx] {
+                        continue;
+                    }
+                    // extract (max 2) alleles
+                    let mut pair = [None, None];
+                    for (i, a) in alleles.iter().take(2).enumerate() {
+                        pair[i] = match a.index() {
+                            Some(idx) if idx >= 0 => Some(idx as u8),
+                            _ => None,
+                        };
+                    }
+                    if pair.iter().all(|x| x.is_none()) {
+                        gt_vec.push(None);
+                    } else {
+                        gt_vec.push(Some(pair));
+                    }
                 }
-                // extract (max 2) alleles
-                let mut pair = [None, None];
-                for (i, a) in alleles.iter().take(2).enumerate() {
-                    pair[i] = match a.index() {
-                        Some(idx) if idx >= 0 => Some(idx as u8),
-                        _ => None,
-                    };
-                }
-                if pair.iter().all(|x| x.is_none()) {
-                    gt_vec.push(None);
-                } else {
-                    gt_vec.push(Some(pair));
-                }
+                map.insert(grp.clone(), gt_vec);
             }
-            let stats = calc_af(&gt_vec);
+            map
+        };
+
+        for tag in all_tags_combination.iter() {
+            let full = format!("{tag}");
+            rec.push_info_string(&full.as_bytes(), &[])?;
+        }
+
+        for grp in &groups {
+            let stats = calc_af(&gt_vec_map[grp]);
 
             // ALT allele 仅写 AC/MAC 的 ALT 值，与 Python 逻辑保持一致
+
             for tag in &want_tags {
                 let full = format!("{tag}_{grp}");
+
+                rec.push_info_string(&full.as_bytes(), &[])?;
+
                 match *tag {
-                    "AC" => rec.push_info_integer(&full, &[stats.ac[1] as i32])?,
-                    "MAC" => rec.push_info_integer(&full, &[stats.mac as i32])?,
-                    "AN" => rec.push_info_integer(&full, &[stats.an as i32])?,
-                    "N_HEMI" => rec.push_info_integer(&full, &[stats.n_hemi as i32])?,
-                    "N_MISS" => rec.push_info_integer(&full, &[stats.n_miss as i32])?,
-                    "N_HOMREF" => rec.push_info_integer(&full, &[stats.n_homref as i32])?,
-                    "N_HET" => rec.push_info_integer(&full, &[stats.n_het as i32])?,
-                    "N_HOMALT" => rec.push_info_integer(&full, &[stats.n_homalt as i32])?,
-                    "AF" => rec.push_info_float(&full, &[stats.af as f32])?,
-                    "MAF" => rec.push_info_float(&full, &[stats.maf as f32])?,
-                    "ExcHet" => rec.push_info_float(&full, &[stats.exc_het as f32])?,
-                    "HWE" => rec.push_info_float(&full, &[stats.hwe as f32])?,
+                    "AC" => rec.push_info_integer(&full.as_bytes(), &[stats.ac[1] as i32])?,
+                    "MAC" => rec.push_info_integer(&full.as_bytes(), &[stats.mac as i32])?,
+                    "AN" => rec.push_info_integer(&full.as_bytes(), &[stats.an as i32])?,
+                    "N_HEMI" => rec.push_info_integer(&full.as_bytes(), &[stats.n_hemi as i32])?,
+                    "N_MISS" => rec.push_info_integer(&full.as_bytes(), &[stats.n_miss as i32])?,
+                    "N_HOMREF" => {
+                        rec.push_info_integer(&full.as_bytes(), &[stats.n_homref as i32])?
+                    }
+                    "N_HET" => rec.push_info_integer(&full.as_bytes(), &[stats.n_het as i32])?,
+                    "N_HOMALT" => {
+                        rec.push_info_integer(&full.as_bytes(), &[stats.n_homalt as i32])?
+                    }
+                    "AF" => rec.push_info_float(&full.as_bytes(), &[stats.af as f32])?,
+                    "MAF" => rec.push_info_float(&full.as_bytes(), &[stats.maf as f32])?,
                     _ => {}
                 }
             }
@@ -283,6 +301,6 @@ fn main() -> Result<()> {
         writer.write(&rec)?;
     }
 
-    info!("Finished grpaf‑rs");
+    println!("Finished vcfgrpaf");
     Ok(())
 }

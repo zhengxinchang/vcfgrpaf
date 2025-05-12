@@ -1,13 +1,11 @@
 [package]
 name = "vcfgrpaf"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rust-htslib = "0.44"          # 需系统有 libhts
 csv = "1"
 anyhow = "1"
-log = "0.4"
-env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
