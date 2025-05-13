@@ -3,13 +3,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use csv::ReaderBuilder;
 use rust_htslib::{
-    bam::header,
     bcf::{self, Header, HeaderRecord, Read, Reader as BcfReader, Writer},
 };
 
 use std::{
-    any::Any,
-    collections::{HashMap, HashSet}, fmt::Pointer,
+
+    collections::{HashMap, HashSet}
 };
 
 #[derive(Parser, Debug)]
