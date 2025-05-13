@@ -1,5 +1,5 @@
 # vcfgrpaf
-vcfgrpaf is a fast, Rust-based implementation of grpaf.py from Truvari, designed for calculating allele frequency statistics per group from VCF files.
+vcfgrpaf is a fast, Rust-based implementation of grpaf.py from [Truvari](https://github.com/ACEnglish/truvari), designed for calculating allele frequency statistics per group from VCF files.
 
 # Features
 Reads genotype data from standard VCF files.
