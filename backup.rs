@@ -9,7 +9,7 @@ use rust_htslib::{
 
 use std::{
     any::Any,
-    collections::{HashMap, HashSet}, fmt::Pointer,
+    collections::{HashMap, HashSet},
 };
 
 #[derive(Parser, Debug)]
@@ -139,27 +139,10 @@ fn main() -> Result<()> {
     }
 
     // inject new header lines
-
+    let mut out_hdr = Header::from_template(bcf.header());
     let want_tags = [
         "AF", "MAF", "MAC", "AC", "AN", "N_HEMI", "N_MISS", "N_HOMREF", "N_HET", "N_HOMALT",
     ];
-    let all_tags = [
-        "ExcHet_",
-        "HWE_",
-        "AF_",
-        "MAF_",
-        "MAC_",
-        "AC_",
-        "AN_",
-        "N_HEMI_",
-        "N_MISS_",
-        "N_HOMREF_",
-        "N_HET_",
-        "N_HOMALT_",
-    ];
-
-    let mut out_hdr = Header::from_template(bcf.header());
-    
 
     let mut add_info_line = |id: &str, num: &str, typ: &str, desc: &str| {
         let line = format!("##INFO=<ID={id},Number={num},Type={typ},Description=\"{desc}\">");
@@ -194,9 +177,24 @@ fn main() -> Result<()> {
         }
     }
 
+    let all_tags = [
+        "ExcHet_",
+        "HWE_",
+        "AF_",
+        "MAF_",
+        "MAC_",
+        "AC_",
+        "AN_",
+        "N_HEMI_",
+        "N_MISS_",
+        "N_HOMREF_",
+        "N_HET_",
+        "N_HOMALT_",
+    ];
+
     // generates all tags that start with all_tags in to a vec
     let mut all_tags_combination: Vec<String> = Vec::new();
-    for (_, values) in headerview
+    for (tag, values) in headerview
         .header_records()
         .iter()
         .filter_map(|record| match record {
@@ -207,13 +205,16 @@ fn main() -> Result<()> {
         let empty = String::from("NOT_FOUND");
         let id = values.get("ID").unwrap_or(&empty);
         if all_tags.iter().any(|x| {
+            if id == "ANNOVAR_DATE" {
+                dbg!(x, id);
+            }
             id.starts_with(x)
         }) {
             all_tags_combination.push(id.to_string());
         }
     }
 
-    eprintln!("Found related tags in input VCF:  {:?}", all_tags_combination);
+    eprintln!("Found {:?} tags in input VCF", all_tags_combination);
 
     // open output file
     let mut writer = if opts.output == "-" {
@@ -270,6 +271,8 @@ fn main() -> Result<()> {
 
         for grp in &groups {
             let stats = calc_af(&gt_vec_map[grp]);
+
+            // ALT allele 仅写 AC/MAC 的 ALT 值，与 Python 逻辑保持一致
 
             for tag in &want_tags {
                 let full = format!("{tag}_{grp}");

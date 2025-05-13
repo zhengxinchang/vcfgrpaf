@@ -2,7 +2,7 @@ build:
 	cargo build --target x86_64-unknown-linux-musl --release
 run:build
 	time target/x86_64-unknown-linux-musl/release/vcfgrpaf  test/bbb.vcf.gz  -l test/sample_group_mini  -o bb.vcf.gz 
-	time target/x86_64-unknown-linux-musl/release/vcfgrpaf  test/aaa.vcf.gz  -l test/sample_group_mini  -o aa.vcf.gz 
+	#time target/x86_64-unknown-linux-musl/release/vcfgrpaf  test/aaa.vcf.gz  -l test/sample_group_mini  -o aa.vcf.gz 
 tru:
 	time truvari anno grpaf -l test/sample_group_mini -t AF,MAF,MAC,AC,AN,N_HEMI,N_MISS,N_HOMREF,N_HET,N_HOMALT  -o trivari_aa.vcf.gz  test/bbb.vcf.gz
 

@@ -9,3 +9,4 @@ rust-htslib = "0.44"          # 需系统有 libhts
 csv = "1"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+crossbeam = "*"
